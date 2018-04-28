@@ -1,5 +1,6 @@
 from __future__ import absolute_import, division, print_function
 
+import io
 import itertools
 import math
 import types
@@ -27,8 +28,8 @@ except ImportError:
     from toolz import (frequencies, merge_with, join, reduceby,
                        count, pluck, groupby, topk)
 
-from ..base import Base, tokenize, dont_optimize, is_dask_collection
-from ..bytes.core import write_bytes
+from ..base import tokenize, dont_optimize, is_dask_collection, DaskMethodsMixin
+from ..bytes import open_files
 from ..compatibility import apply, urlopen
 from ..context import _globals, globalmethod
 from ..core import quote, istask, get_dependencies, reverse_dict
@@ -36,7 +37,7 @@ from ..delayed import Delayed
 from ..multiprocessing import get as mpget
 from ..optimization import fuse, cull, inline
 from ..utils import (system_encoding, takes_multiple_arguments, funcname,
-                     digit, insert, ensure_dict)
+                     digit, insert, ensure_dict, ensure_bytes, ensure_unicode)
 
 
 no_default = '__no__default__'
@@ -115,6 +116,23 @@ def optimize(dsk, keys, fuse_keys=None, rename_fused_keys=True, **kwargs):
     return dsk5
 
 
+def _to_textfiles_chunk(data, lazy_file):
+    with lazy_file as f:
+        if isinstance(f, io.TextIOWrapper):
+            endline = u'\n'
+            ensure = ensure_unicode
+        else:
+            endline = b'\n'
+            ensure = ensure_bytes
+        started = False
+        for d in data:
+            if started:
+                f.write(endline)
+            else:
+                started = True
+            f.write(ensure(d))
+
+
 def to_textfiles(b, path, name_function=None, compression='infer',
                  encoding=system_encoding, compute=True, get=None,
                  storage_options=None):
@@ -171,21 +189,21 @@ def to_textfiles(b, path, name_function=None, compression='infer',
 
     >>> b_dict.map(json.dumps).to_textfiles("/path/to/data/*.json")  # doctest: +SKIP
     """
-    from dask import delayed
-    (writes,names) = write_bytes(b.to_delayed(), path, name_function, compression,
-                                 encoding=encoding, **(storage_options or {}))
+    mode = 'wb' if encoding is None else 'wt'
+    files = open_files(path, compression=compression, mode=mode,
+                       encoding=encoding, name_function=name_function,
+                       num=b.npartitions, **(storage_options or {}))
 
-    # Use Bag optimizations on these delayed objects
-    dsk = ensure_dict(delayed(writes).dask)
-    dsk2 = Bag.__dask_optimize__(dsk, [w.key for w in writes])
-    out = [Delayed(w.key, dsk2) for w in writes]
+    name = 'to-textfiles-' + uuid.uuid4().hex
+    dsk = {(name, i): (_to_textfiles_chunk, (b.name, i), f)
+           for i, f in enumerate(files)}
+    out = type(b)(merge(dsk, b.dask), name, b.npartitions)
 
     if compute:
-        get = get or _globals.get('get', None) or Bag.__dask_scheduler__
-        delayed(out).compute(get=get)
-        return names
+        out.compute(get=get)
+        return [f.path for f in files]
     else:
-        return out
+        return out.to_delayed()
 
 
 def finalize(results):
@@ -267,7 +285,7 @@ def robust_wraps(wrapper):
     return _
 
 
-class Item(Base):
+class Item(DaskMethodsMixin):
     def __init__(self, dsk, key):
         self.dask = dsk
         self.key = key
@@ -319,20 +337,25 @@ class Item(Base):
         dsk = {name: (func, self.key)}
         return Item(merge(self.dask, dsk), name)
 
-    __int__ = __float__ = __complex__ = __bool__ = Base.compute
+    __int__ = __float__ = __complex__ = __bool__ = DaskMethodsMixin.compute
 
-    def to_delayed(self):
-        """ Convert bag item to dask.delayed.
+    def to_delayed(self, optimize_graph=True):
+        """Convert into a ``dask.delayed`` object.
 
-        Returns a single value.
+        Parameters
+        ----------
+        optimize_graph : bool, optional
+            If True [default], the graph is optimized before converting into
+            ``dask.delayed`` objects.
         """
         from dask.delayed import Delayed
-        dsk = self.__dask_optimize__(self.__dask_graph__(),
-                                     self.__dask_keys__())
+        dsk = self.__dask_graph__()
+        if optimize_graph:
+            dsk = self.__dask_optimize__(dsk, self.__dask_keys__())
         return Delayed(self.key, dsk)
 
 
-class Bag(Base):
+class Bag(DaskMethodsMixin):
     """ Parallel collection of Python objects
 
     Examples
@@ -593,6 +616,10 @@ class Bag(Base):
         Parameters
         ----------
         func : callable
+            The function to be called on every partition.
+            This function should expect an ``Iterator`` or ``Iterable`` for
+            every partition and should return an ``Iterator`` or ``Iterable``
+            in return.
         *args, **kwargs : Bag, Item, Delayed, or object
             Arguments and keyword arguments to pass to ``func``.
             Partitions from this bag will be the first argument, and these will
@@ -891,21 +918,65 @@ class Bag(Base):
     def join(self, other, on_self, on_other=None):
         """ Joins collection with another collection.
 
-        Other collection must be an Iterable, and not a Bag.
+        Other collection must be one of the following:
 
+        1.  An iterable.  We recommend tuples over lists for internal
+            performance reasons.
+        2.  A delayed object, pointing to a tuple.  This is recommended if the
+            other collection is sizable and you're using the distributed
+            scheduler.  Dask is able to pass around data wrapped in delayed
+            objects with greater sophistication.
+        3.  A Bag with a single partition
+
+        You might also consider Dask Dataframe, whose join operations are much
+        more heavily optimized.
+
+        Parameters
+        ----------
+        other: Iterable, Delayed, Bag
+            Other collection on which to join
+        on_self: callable
+            Function to call on elements in this collection to determine a
+            match
+        on_other: callable (defaults to on_self)
+            Function to call on elements in the other collection to determine a
+            match
+
+        Examples
+        --------
         >>> people = from_sequence(['Alice', 'Bob', 'Charlie'])
         >>> fruit = ['Apple', 'Apricot', 'Banana']
         >>> list(people.join(fruit, lambda x: x[0]))  # doctest: +SKIP
         [('Apple', 'Alice'), ('Apricot', 'Alice'), ('Banana', 'Bob')]
         """
-        assert isinstance(other, Iterable)
-        assert not isinstance(other, Bag)
+        name = 'join-' + tokenize(self, other, on_self, on_other)
+        dsk = {}
+        if isinstance(other, Bag):
+            if other.npartitions == 1:
+                dsk.update(other.dask)
+                other = other.__dask_keys__()[0]
+                dsk['join-%s-other' % name] = (list, other)
+            else:
+                msg = ("Multi-bag joins are not implemented. "
+                       "We recommend Dask dataframe if appropriate")
+                raise NotImplementedError(msg)
+        elif isinstance(other, Delayed):
+            dsk.update(other.dask)
+            other = other._key
+        elif isinstance(other, Iterable):
+            other = other
+        else:
+            msg = ("Joined argument must be single-partition Bag, "
+                   " delayed object, or Iterable, got %s" %
+                   type(other).__name)
+            raise TypeError(msg)
+
         if on_other is None:
             on_other = on_self
-        name = 'join-' + tokenize(self, other, on_self, on_other)
-        dsk = dict(((name, i), (list, (join, on_other, other,
-                                       on_self, (self.name, i))))
-                   for i in range(self.npartitions))
+
+        dsk.update({(name, i): (list, (join, on_other, other,
+                                       on_self, (self.name, i)))
+                   for i in range(self.npartitions)})
         return type(self)(merge(self.dask, dsk), name, self.npartitions)
 
     def product(self, other):
@@ -1242,14 +1313,24 @@ class Bag(Base):
         divisions = [None] * (self.npartitions + 1)
         return dd.DataFrame(dsk, name, meta, divisions)
 
-    def to_delayed(self):
-        """ Convert bag to list of dask Delayed.
+    def to_delayed(self, optimize_graph=True):
+        """Convert into a list of ``dask.delayed`` objects, one per partition.
 
-        Returns list of Delayed, one per partition.
+        Parameters
+        ----------
+        optimize_graph : bool, optional
+            If True [default], the graph is optimized before converting into
+            ``dask.delayed`` objects.
+
+        See Also
+        --------
+        dask.bag.from_delayed
         """
         from dask.delayed import Delayed
         keys = self.__dask_keys__()
-        dsk = self.__dask_optimize__(self.__dask_graph__(), keys)
+        dsk = self.__dask_graph__()
+        if optimize_graph:
+            dsk = self.__dask_optimize__(dsk, keys)
         return [Delayed(k, dsk) for k in keys]
 
     def repartition(self, npartitions):

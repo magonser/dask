@@ -18,6 +18,7 @@ from dask.bag.core import (Bag, lazify, lazify_task, map, collect,
                            reduceby, reify, partition, inline_singleton_lists,
                            optimize, from_delayed)
 from dask.compatibility import BZ2File, GzipFile, PY2
+from dask.delayed import Delayed
 from dask.utils import filetexts, tmpfile, tmpdir
 from dask.utils_test import inc, add
 
@@ -29,6 +30,15 @@ dsk = {('x', 0): (range, 5),
 L = list(range(5)) * 3
 
 b = Bag(dsk, 'x', 3)
+
+
+def assert_eq(a, b):
+    if hasattr(a, 'compute'):
+        a = a.compute(get=dask.local.get_sync)
+    if hasattr(b, 'compute'):
+        b = b.compute(get=dask.local.get_sync)
+
+    assert a == b
 
 
 def iseven(x):
@@ -352,12 +362,18 @@ def test_var():
     assert float(b.var()) == 2.0
 
 
-def test_join():
-    c = b.join([1, 2, 3], on_self=isodd, on_other=iseven)
-    assert list(c) == list(join(iseven, [1, 2, 3], isodd, list(b)))
-    assert (list(b.join([1, 2, 3], isodd)) ==
-            list(join(isodd, [1, 2, 3], isodd, list(b))))
-    assert c.name == b.join([1, 2, 3], on_self=isodd, on_other=iseven).name
+@pytest.mark.parametrize('transform', [
+    identity,
+    dask.delayed,
+    lambda x: db.from_sequence(x, npartitions=1)
+])
+def test_join(transform):
+    other = transform([1, 2, 3])
+    c = b.join(other, on_self=isodd, on_other=iseven)
+    assert_eq(c, list(join(iseven, [1, 2, 3], isodd, list(b))))
+    assert_eq(b.join(other, isodd),
+              list(join(isodd, [1, 2, 3], isodd, list(b))))
+    assert c.name == b.join(other, on_self=isodd, on_other=iseven).name
 
 
 def test_foldby():
@@ -972,8 +988,6 @@ def test_bag_compute_forward_kwargs():
 
 
 def test_to_delayed():
-    from dask.delayed import Delayed
-
     b = db.from_sequence([1, 2, 3, 4, 5, 6], npartitions=3)
     a, b, c = b.map(inc).to_delayed()
     assert all(isinstance(x, Delayed) for x in [a, b, c])
@@ -985,17 +999,24 @@ def test_to_delayed():
     assert t.compute() == 21
 
 
-def test_to_delayed_optimizes():
+def test_to_delayed_optimize_graph():
     b = db.from_sequence([1, 2, 3, 4, 5, 6], npartitions=1)
     b2 = b.map(inc).map(inc).map(inc)
 
     [d] = b2.to_delayed()
     text = str(dict(d.dask))
     assert text.count('reify') == 1
+    [d2] = b2.to_delayed(optimize_graph=False)
+    assert dict(d2.dask) == dict(b2.dask)
+    assert d.compute() == d2.compute()
 
-    d = b2.sum().to_delayed()
+    x = b2.sum()
+    d = x.to_delayed()
     text = str(dict(d.dask))
     assert text.count('reify') == 0
+    d2 = x.to_delayed(optimize_graph=False)
+    assert dict(d2.dask) == dict(x.dask)
+    assert d.compute() == d2.compute()
 
     [d] = b2.to_textfiles('foo.txt', compute=False)
     text = str(dict(d.dask))
