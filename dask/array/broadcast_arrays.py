@@ -71,8 +71,17 @@ def _inverse(seq):
     >>> _inverse([None, 1, 0])
     [2, 1] 
     """
-    n = max(filter(None, seq))
+    if not seq:
+        return []
+    n = max(filter(lambda e: e is not None, seq))
     return [_where(seq, i) for i in range(n+1)]
+
+
+def _argsort(list_):
+    """
+    Simple argsort in pure python
+    """
+    return sorted(range(len(list_)), key=list_.__getitem__)
 
 
 def broadcast_arrays(*args, **kwargs):
@@ -168,51 +177,72 @@ def broadcast_arrays(*args, **kwargs):
     # Input processing
     to_array = asanyarray if subok else asarray
     args = tuple(to_array(e) for e in args)
+    nargs = len(args)
     shapes = [e.shape for e in args]
-    chunkss = [[i[0] for i in e.chunks] for e in args]
+    chunkss = [tuple(i[0] for i in e.chunks) for e in args]
     ndimss = [len(s) for s in shapes]
-
-    # Inject default behavior for signature
-    if signature is None:
-        signature = [tuple(reversed(range(n))) for n in ndimss]
 
     # Parse signature
     if isinstance(signature, str):
-        array_dimss, core_dimss = _parse_signature(signature)
+        lhs_dimss, rhs_dimss = _parse_signature(signature)
     elif isinstance(signature, tuple):
-        array_dimss, core_dimss = signature
+        lhs_dimss, rhs_dimss = signature
     elif isinstance(signature, list):
-        array_dimss = signature
-        core_dimss = []
+        lhs_dimss = signature
+        rhs_dimss = []
     elif signature is None:
-        array_dimss = [reversed(range(n) for n in ndimss)]
-        core_dimss = []
+        # Inject default behavior for signature
+        lhs_dimss = [tuple(reversed(range(n))) for n in ndimss]
+        rhs_dimss = []
     else:
         raise ValueError("``signature`` is invalid")
-    core_dimss = core_dimss if core_dimss else [tuple()]*len(array_dimss)
+    rhs_dimss = rhs_dimss if rhs_dimss else [tuple()]*nargs
+    lhs_dimss = lhs_dimss if lhs_dimss else [tuple(reversed(range(n - len(rhs_dims)))) for n, rhs_dims in zip(ndimss, rhs_dimss)]
 
     # Check consistency of passed arguments
-    if len(array_dimss) != len(args):
+    if len(lhs_dimss) != len(args):
         raise ValueError("``signature`` does not match number of input arrays")
-    if len(core_dimss) != len(args):
+    if len(rhs_dimss) != len(args):
         raise ValueError("``signature`` does not match number of input arrays on right hand side")
 
-    for idx, ndims, array_dims, core_dims in zip(count(1), ndimss, array_dimss, core_dimss):
-        if len(set(array_dims)) != len(array_dims):
+    # Check consistency of passed dimensions
+    for idx, ndims, lhs_dims, rhs_dims in zip(count(1), ndimss, lhs_dimss, rhs_dimss):
+        if (len(set(lhs_dims)) != len(lhs_dims)) or \
+           (len(set(rhs_dims)) != len(rhs_dims)):
             raise ValueError("Repeated dimension name for array #{} in signature".format(idx))
-        if len(array_dims) > ndims:
+        if len(lhs_dims) > ndims:
             raise ValueError("Too many dimension(s) for input array #{} in signature given".format(idx))
-        if not set(core_dims).issubset(array_dims):
-            raise ValueError("Core dimension(s) ``{}`` are not given on left hand side ``{}`` for array #{} in signature".format(core_dims, array_dims, idx))
     
-    # Extend missing core dims
-    new_core_dimss = [tuple('__broadcast_arrays_coredim_{}_{}'.format(i, j) for j in range(n - len(ad))) \
-                      for i, n, ad in zip(count(), ndimss, array_dimss)]
-    core_dimss = [cd + ncd for cd, ncd in zip(core_dimss, new_core_dimss)]
-    array_dimss = [ad + ncd for ad, ncd in zip(array_dimss, new_core_dimss)]
+    # Construct complete dimension names of passed arrays
+    in_dimss = []
+    auto_core_dimss = []
+    for idx, ndims, lhs_dims, rhs_dims in  zip(count(), ndimss, lhs_dimss, rhs_dimss):
+        in_dims = list(lhs_dims)
+        auto_core_dims = tuple()
+        ndiff = ndims - len(in_dims)
+        assert ndiff >= 0  # Should not occur
+        if ndiff == 0:
+            # Mode 1) LHS provided all dimension names
+            pass
+        elif len(rhs_dims) == 0:
+            # Mode 2) No RHS, we automatically create dimension names for them and consider them core dims, i.e.
+            # unique from dimensions at same positions in other passed arrays
+            auto_core_dims = tuple('__broadcast_arrays_coredim_{}_{}'.format(idx, j) for j in range(ndiff))
+            in_dims.extend(auto_core_dims)
+        else:
+            # Mode 3) We can attach the missing dim names from RHS if they won't lead to repeated
+            # dimensions names
+            in_dims.extend(rhs_dims[-ndiff:])
+            if len(in_dims) != ndims:
+                raise ValueError("Signature for array #{} cannot be created easily - please clarify dimensions".format(idx))
+        in_dimss.append(in_dims)
+        auto_core_dimss.append(auto_core_dims)
+        # Check consistency of in_dimss construction
+        if len(set(in_dims)) != len(in_dims):
+            raise ValueError("Repeated dimension name for array #{} in signature".format(idx))
 
-    # Check that the arrays have same length for same dimensions
-    _temp = groupby(0, concat(zip(ad, s) for ad, s in zip(array_dimss, shapes)))
+    # Check that the arrays have same length for same dimensions or dimension `1`
+    _temp = groupby(0, concat(zip(ad, s) for ad, s in zip(in_dimss, shapes)))
     dimsizess = valmap(compose(set, partial(map, itemgetter(1))), _temp)
     for dim, sizes in dimsizess.items():
         if sizes.union({1}) != {1, max(sizes)}:
@@ -220,7 +250,7 @@ def broadcast_arrays(*args, **kwargs):
     dimsizes = valmap(max, dimsizess)
 
     # Check if arrays have same chunk size for the same dimension
-    _temp = groupby(0, concat(zip(ad, s, c) for ad, s, c in zip(array_dimss, shapes, chunkss)))
+    _temp = groupby(0, concat(zip(ad, s, c) for ad, s, c in zip(lhs_dimss, shapes, chunkss)))
     dimchunksizess = valmap(compose(set,
                                     partial(map, itemgetter(1)),
                                     partial(filter, lambda e: e != (1, 1)),
@@ -232,42 +262,50 @@ def broadcast_arrays(*args, **kwargs):
     dimchunksizes = valmap(max, dimchunksizess)
 
     # Find loop dims and union of all loop dims in order of appearance
-    _temp = ((d for d in ad if d not in cd) for ad, cd in zip(array_dimss, core_dimss))
-    total_loop_dims = tuple(unique(concat(_temp)))
+    auto_loop_dimss = [tuple(i for i in id_ if i not in rd)
+                          for id_, rd in zip(lhs_dimss, rhs_dimss)]
 
-    total_loop_dims_id = dict(zip(total_loop_dims, count(-1, -1)))
-    total_loop_dims_id_inv = {v: k for k, v in total_loop_dims_id.items()}
+    # According to https://docs.scipy.org/doc/numpy-1.14.0/user/basics.broadcasting.html automatic broadcasting
+    # is right aligned. Therefore to determine the correct order of dim names for auto broadcasting, we sort the
+    # arrays from many loop dims to few loop dims and then then order of total loop dims will be in order of
+    # their appearance
+    _auto_loop_dimss_sorted = sorted(auto_loop_dimss, key=len, reverse=True)
+    auto_total_loop_dims = tuple(unique(concat(_auto_loop_dimss_sorted)))
+
+    out_dimss = [auto_total_loop_dims
+                  + rd
+                  + acd   #??+ tuple(r for r in rd if r not in id_)
+                  for id_, rd, acd in zip(in_dimss, rhs_dimss, auto_core_dimss)]
 
     # Find order of transposition for each array and perform transformations
     new_args = []
-    for arg, array_dims, core_dims, shape, chunks in \
-        zip(args, array_dimss, core_dimss, shapes, chunkss):
+    for arg, out_dims, in_dims, shape, chunks in zip(args, out_dimss, in_dimss, shapes, chunkss):
 
         # Find new position of given dimension and maybe indicate dimensions which have to be created
-        old2new_poss = []
-        for loop_dim in total_loop_dims:
-            oidx = _where(array_dims, loop_dim)
-            old2new_poss.append(oidx if oidx is not None else total_loop_dims_id[loop_dim])  # Insert new dim if not present
-        for core_dim in core_dims:
-            old2new_poss.append(_where(array_dims, core_dim))
+        in2out_poss = []
+        for idx, out_dim in enumerate(out_dims):
+            oidx = _where(in_dims, out_dim)
+            if oidx is None:
+                oidx = -idx-1
+            in2out_poss.append(oidx)  # Insert new dim if not present
+        # Determine order for later transposition
+        _temp = _argsort(in2out_poss)
+        transpose_idcs = _inverse(_temp)
+        sorted_in2out_poss = sorted(in2out_poss)
 
         # Determine the new shape size by pre-pending newly created dimensions
         if sparse is True:
-            new_shape = tuple(1 for i in old2new_poss if i < 0) + shape
+            new_shape = tuple(1 for i in in2out_poss if i < 0) + shape
         else:
-            # If we had size `1` amongst existing loop dims, we also need to have a new shape for them
-            new_shape = tuple(dimsizes[total_loop_dims_id_inv[i]] for i in old2new_poss if i < 0) \
-                      + tuple(s if d not in total_loop_dims else dimsizes[d] for d, s in zip(array_dims, shape))
+            new_shape = tuple(dimsizes[out_dims[-i-1]] for i in sorted_in2out_poss if i < 0) \
+                      + tuple(dimsizes[in_dims[i]] for i in sorted_in2out_poss if i >= 0) # Also need to extend size `1` sparse dimensions in this case
 
-        # Chunks can be original size, in case of `sparse=True` it will be cut back to `1` later
-        new_chunks = tuple(dimchunksizes[total_loop_dims_id_inv[i]] for i in old2new_poss if i < 0) + tuple(chunks)
+        # Chunks can be original size, in case of `sparse=True` it will be cut back to `1` by new_shape
+        new_chunks = tuple(dimchunksizes[out_dims[-i-1]] for i in sorted_in2out_poss if i < 0) + chunks
 
-        # Apply `dask.array.broadcast_to`
+        # Apply old `dask.array.broadcast_to` and `transpose`
         new_arg = broadcast_to(arg, shape=new_shape, chunks=new_chunks)
-
-        # Determine order for transpose and do so
-        idcs = _inverse(np.argsort(old2new_poss).tolist())
-        new_arg = new_arg.transpose(idcs)
+        new_arg = new_arg.transpose(transpose_idcs)
 
         new_args.append(new_arg)
     
