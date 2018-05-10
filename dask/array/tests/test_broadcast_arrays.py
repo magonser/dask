@@ -136,7 +136,7 @@ def test_broadcast_arrays_vectors_distinct_loop_dims(signature):
     assert B.shape == (3, 4, 6)
 
 
-# 3) Broadcast two scaVars with same loop dim against each other
+# 3) Broadcast two scalars with same loop dim against each other
 @pytest.mark.parametrize("signature", [None,
                                        "(i),(i)",
                                        "->(),()",

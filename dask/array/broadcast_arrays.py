@@ -78,7 +78,7 @@ def _inverse(seq):
 
 def _argsort(list_):
     """
-    Simple argsort in pure python
+    Simple argsort in pure Python.
     """
     return sorted(range(len(list_)), key=list_.__getitem__)
 
@@ -87,13 +87,12 @@ def broadcast_arrays(*args, **kwargs):
     """
     Broadcasts arrays against each other.
 
-
     Parameters
     ----------
     *args: Arrays
         Arrays to be broadcast against each other.
 
-    signature: Optional; String, Iterable of Iterable, or None
+    signature: Optional; String, Iterable of Iterable, or None, keyword only
         Specifies loop and core dimensions within each array, where only loop
         dimensions are broadcast. E.g. ``"(i,K),(j)->(K),()"`` is the signature
         for two arrays, where the first array has ``"K"`` as core dimension and
@@ -121,13 +120,13 @@ def broadcast_arrays(*args, **kwargs):
         Note: while the syntax is similar to numpy generalized
         ufuncs [2]_, its meaning here is different.
 
-    sparse: Optional; Bool
+    sparse: Optional; Bool, keyword only
         Specifies if a broadcast should be sparse, i.e. new broadcast
         dimensions are of length 1. If not sparse existing sparse
         dimensions are broadcast to their full size (as stated by
         the other passed arguments). Defaults to ``False``.
 
-    subok: Bool
+    subok: Bool, keyword only
         If True, then sub-classes will be passed-through, otherwise
         the returned array will be forced to be a base-class array
         (default).
@@ -136,7 +135,6 @@ def broadcast_arrays(*args, **kwargs):
     -------
      : Arrays
         Broadcast arrays
-
 
     Examples
     --------
